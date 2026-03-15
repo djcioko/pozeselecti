@@ -5,107 +5,88 @@ from PIL import Image
 import rawpy
 import io
 import zipfile
+import gc
 
-# Configurare pagină
-st.set_page_config(page_title="RAW Photo Selector Pro", layout="wide", page_icon="🏗️")
+# 1. Configurare pagină
+st.set_page_config(page_title="Pro Selector Foto", layout="wide")
 
-# --- FUNCȚII TEHNICE ---
-
+# 2. Funcție procesare imagini (RAW + Standard)
 def process_image(uploaded_file):
-    """Procesează fișiere RAW și formate standard."""
-    extension = uploaded_file.name.split('.')[-1].lower()
-    raw_extensions = ['cr2', 'nef', 'arw', 'dng', 'orf', 'sr2']
-    
     try:
-        if extension in raw_extensions:
+        ext = uploaded_file.name.split('.')[-1].lower()
+        if ext in ['cr2', 'nef', 'arw', 'dng', 'orf', 'sr2']:
             with rawpy.imread(uploaded_file) as raw:
-                # Folosim un 'half_size' pentru viteză mai mare la previzualizare
-                rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True, bright=1.0, half_size=True)
+                # half_size=True consumă de 4 ori mai puțin RAM
+                rgb = raw.postprocess(use_camera_wb=True, half_size=True, no_auto_bright=True, bright=1.0)
                 return Image.fromarray(rgb)
         else:
-            return Image.open(uploaded_file)
+            img = Image.open(uploaded_file)
+            return img.convert("RGB")
     except Exception as e:
-        st.error(f"Eroare la procesarea {uploaded_file.name}: {e}")
+        st.error(f"Nu pot citi fișierul {uploaded_file.name}: {e}")
         return None
 
-def get_blur_score(pil_image):
-    """Calculează claritatea folosind algoritmul Laplacian."""
-    img_array = np.array(pil_image)
-    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-    return cv2.Laplacian(gray, cv2.CV_64F).var()
+# 3. Funcție calcul claritate
+def get_blur_score(pil_img):
+    try:
+        img_array = np.array(pil_img)
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        score = cv2.Laplacian(gray, cv2.CV_64F).var()
+        del img_array, gray
+        return score
+    except:
+        return 0
 
-# --- LOGICA DE SESIUNE (PENTRU RESTART/MEMORARE) ---
-if 'selected_photos' not in st.session_state:
-    st.session_state.selected_photos = {}
-if 'threshold' not in st.session_state:
-    st.session_state.threshold = 100
+# 4. Interfață Utilizator
+st.title("🏗️ Selector Foto Șantier (RAW & JPG)")
+st.write("Încarcă pozele pentru a filtra automat cadrele neclare.")
 
-# --- INTERFAȚĂ SIDEBAR ---
-st.sidebar.title("⚙️ Setări Control")
-st.session_state.threshold = st.sidebar.slider("Prag Claritate (Threshold)", 0, 1000, st.session_state.threshold)
+# Setări în sidebar
+st.sidebar.header("Setări Analiză")
+threshold = st.sidebar.slider("Prag Claritate (mai mare = mai strict)", 0, 500, 100)
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("📋 Status Selecție")
-
-# --- INTERFAȚĂ PRINCIPALĂ ---
-st.title("📷 Photo Selector - Construcții & RAW")
-st.info("Încarcă fișierele tale (JPG sau RAW). Aplicația le va filtra automat pe cele neclare.")
-
-uploaded_files = st.file_uploader(
-    "Alege pozele de pe șantier...", 
-    accept_multiple_files=True, 
-    type=['jpg', 'jpeg', 'png', 'cr2', 'nef', 'arw', 'dng']
-)
+uploaded_files = st.file_uploader("Încarcă fotografiile", accept_multiple_files=True, type=['jpg', 'jpeg', 'png', 'cr2', 'nef', 'arw', 'dng'])
 
 if uploaded_files:
-    # Resetăm dicționarul de selecție la un nou upload dacă e cazul, 
-    # sau păstrăm ce e deja încărcat
+    st.info(f"Se procesează {len(uploaded_files)} fișiere...")
     
-    cols = st.columns(3)
-    processed_count = 0
-    clear_files = []
-
+    clear_photos = []
+    cols = st.columns(4) # Afișăm pe 4 coloane
+    
     for idx, file in enumerate(uploaded_files):
         img = process_image(file)
         
         if img:
             score = get_blur_score(img)
-            is_clear = score >= st.session_state.threshold
+            is_clear = score >= threshold
             
-            # Salvăm starea în session_state
-            st.session_state.selected_photos[file.name] = is_clear
-
-            with cols[idx % 3]:
-                # Afișare imagine cu ramă colorată în funcție de status
-                st.image(img, caption=f"{file.name} | Scor: {int(score)}", use_container_width=True)
-                
+            with cols[idx % 4]:
+                st.image(img, caption=f"{file.name[:10]}... (Scor: {int(score)})", use_container_width=True)
                 if is_clear:
-                    st.success(f"✅ OK")
-                    clear_files.append(file)
+                    st.success("✅ CLARĂ")
+                    clear_photos.append(file)
                 else:
-                    st.error(f"❌ NECLARĂ")
-            processed_count += 1
+                    st.error("❌ NECLARĂ")
+            
+            # Curățăm memoria RAM imediat după afișare
+            del img
+            gc.collect()
 
-    # --- BUTON DOWNLOAD ZIP (PENTRU SALVARE) ---
-    st.sidebar.write(f"Fișiere clare detectate: **{len(clear_files)}**")
-    
-    if len(clear_files) > 0:
-        # Generăm arhiva ZIP în memorie
+    # 5. Buton de descărcare pentru pozele bune
+    if clear_photos:
+        st.sidebar.markdown("---")
+        st.sidebar.subheader(f"Gata! {len(clear_photos)} poze selectate")
+        
         zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-            for f in clear_files:
-                zip_file.writestr(f.name, f.getvalue())
+        with zipfile.ZipFile(zip_buffer, "a") as zf:
+            for f in clear_photos:
+                zf.writestr(f.name, f.getvalue())
         
         st.sidebar.download_button(
-            label="⬇️ Descarcă pozele CLARE (.zip)",
+            label="⬇️ Descarcă ZIP cu pozele bune",
             data=zip_buffer.getvalue(),
-            file_name="poze_selectate_constructii.zip",
+            file_name="poze_clare_santier.zip",
             mime="application/zip"
         )
-
 else:
-    st.write("Aștept încărcarea fișierelor...")
-
-# Instrucțiuni sub formă de footer
-st.markdown("---")
-st.caption("Aplicație creată pentru filtrarea rapidă a fotografiilor de șantier. Suportă formate RAW (Canon, Nikon, Sony, DNG).")
+    st.info("Aștept fișiere pentru procesare.")
