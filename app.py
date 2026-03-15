@@ -2,70 +2,110 @@ import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image
-import os
+import rawpy
+import io
+import zipfile
 
-# Setări Pagină
-st.set_page_config(page_title="Photo Selector Pro", layout="wide")
+# Configurare pagină
+st.set_page_config(page_title="RAW Photo Selector Pro", layout="wide", page_icon="🏗️")
 
-# Funcție pentru calcularea clarității (Laplacian Variance)
-def get_blur_score(image):
-    img_array = np.array(image)
+# --- FUNCȚII TEHNICE ---
+
+def process_image(uploaded_file):
+    """Procesează fișiere RAW și formate standard."""
+    extension = uploaded_file.name.split('.')[-1].lower()
+    raw_extensions = ['cr2', 'nef', 'arw', 'dng', 'orf', 'sr2']
+    
+    try:
+        if extension in raw_extensions:
+            with rawpy.imread(uploaded_file) as raw:
+                # Folosim un 'half_size' pentru viteză mai mare la previzualizare
+                rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True, bright=1.0, half_size=True)
+                return Image.fromarray(rgb)
+        else:
+            return Image.open(uploaded_file)
+    except Exception as e:
+        st.error(f"Eroare la procesarea {uploaded_file.name}: {e}")
+        return None
+
+def get_blur_score(pil_image):
+    """Calculează claritatea folosind algoritmul Laplacian."""
+    img_array = np.array(pil_image)
     gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
-# --- PERSISTENȚĂ (MEMORARE SETĂRI) ---
-if 'selected_files' not in st.session_state:
-    st.session_state.selected_files = []
+# --- LOGICA DE SESIUNE (PENTRU RESTART/MEMORARE) ---
+if 'selected_photos' not in st.session_state:
+    st.session_state.selected_photos = {}
 if 'threshold' not in st.session_state:
-    st.session_state.threshold = 100.0
+    st.session_state.threshold = 100
 
-# --- INTERFAȚĂ ---
-st.title("🏗️ Șantier Photo Selector")
-st.sidebar.header("Setări Analiză")
+# --- INTERFAȚĂ SIDEBAR ---
+st.sidebar.title("⚙️ Setări Control")
+st.session_state.threshold = st.sidebar.slider("Prag Claritate (Threshold)", 0, 1000, st.session_state.threshold)
 
-# Slider pentru pragul de claritate
-st.session_state.threshold = st.sidebar.slider(
-    "Prag Claritate (mai mare = mai strict)", 
-    0.0, 500.0, st.session_state.threshold
-)
+st.sidebar.markdown("---")
+st.sidebar.subheader("📋 Status Selecție")
+
+# --- INTERFAȚĂ PRINCIPALĂ ---
+st.title("📷 Photo Selector - Construcții & RAW")
+st.info("Încarcă fișierele tale (JPG sau RAW). Aplicația le va filtra automat pe cele neclare.")
 
 uploaded_files = st.file_uploader(
-    "Încarcă fotografiile de pe șantier", 
+    "Alege pozele de pe șantier...", 
     accept_multiple_files=True, 
-    type=['jpg', 'jpeg', 'png']
+    type=['jpg', 'jpeg', 'png', 'cr2', 'nef', 'arw', 'dng']
 )
 
 if uploaded_files:
-    cols = st.columns(3)
-    idx = 0
+    # Resetăm dicționarul de selecție la un nou upload dacă e cazul, 
+    # sau păstrăm ce e deja încărcat
     
-    for uploaded_file in uploaded_files:
-        # Procesare imagine
-        image = Image.open(uploaded_file)
-        score = get_blur_score(image)
+    cols = st.columns(3)
+    processed_count = 0
+    clear_files = []
+
+    for idx, file in enumerate(uploaded_files):
+        img = process_image(file)
         
-        is_clear = score >= st.session_state.threshold
-        
-        # Afișare în coloane
-        with cols[idx % 3]:
-            st.image(image, caption=f"Scor: {int(score)}", use_container_width=True)
+        if img:
+            score = get_blur_score(img)
+            is_clear = score >= st.session_state.threshold
             
-            if is_clear:
-                st.success("✅ Clară")
-                if uploaded_file.name not in st.session_state.selected_files:
-                    st.session_state.selected_files.append(uploaded_file.name)
-            else:
-                st.error("❌ Mișcată")
-                if uploaded_file.name in st.session_state.selected_files:
-                    st.session_state.selected_files.remove(uploaded_file.name)
-        idx += 1
+            # Salvăm starea în session_state
+            st.session_state.selected_photos[file.name] = is_clear
 
-# --- REZUMAT ȘI SALVARE ---
-st.sidebar.markdown("---")
-st.sidebar.write(f"📂 Fișiere selectate: **{len(st.session_state.selected_files)}**")
+            with cols[idx % 3]:
+                # Afișare imagine cu ramă colorată în funcție de status
+                st.image(img, caption=f"{file.name} | Scor: {int(score)}", use_container_width=True)
+                
+                if is_clear:
+                    st.success(f"✅ OK")
+                    clear_files.append(file)
+                else:
+                    st.error(f"❌ NECLARĂ")
+            processed_count += 1
 
-if st.sidebar.button("Salvează Selecția"):
-    # Aici poți adăuga logica de export (ex: creare folder sau listă text)
-    st.sidebar.toast("Selecția a fost salvată în memorie!")
+    # --- BUTON DOWNLOAD ZIP (PENTRU SALVARE) ---
+    st.sidebar.write(f"Fișiere clare detectate: **{len(clear_files)}**")
+    
+    if len(clear_files) > 0:
+        # Generăm arhiva ZIP în memorie
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+            for f in clear_files:
+                zip_file.writestr(f.name, f.getvalue())
+        
+        st.sidebar.download_button(
+            label="⬇️ Descarcă pozele CLARE (.zip)",
+            data=zip_buffer.getvalue(),
+            file_name="poze_selectate_constructii.zip",
+            mime="application/zip"
+        )
 
-st.sidebar.info("Aplicația va ține minte fișierele selectate pe durata sesiunii deschise.")
+else:
+    st.write("Aștept încărcarea fișierelor...")
+
+# Instrucțiuni sub formă de footer
+st.markdown("---")
+st.caption("Aplicație creată pentru filtrarea rapidă a fotografiilor de șantier. Suportă formate RAW (Canon, Nikon, Sony, DNG).")
